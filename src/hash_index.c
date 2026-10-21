@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/vfs.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 
@@ -233,6 +234,95 @@ static void hash_index_prepare(RaucHashIndex *idx)
 	idx->match_stats = r_stats_new(idx->label);
 }
 
+#define READ_FILE_THREADS 16
+
+typedef struct {
+	int fd;
+	guint8 *data;
+	off_t offset;
+	gsize len;
+	int err;
+} ReadFileRange;
+
+static gpointer read_file_range(gpointer data)
+{
+	ReadFileRange *range = data;
+	gsize pos = 0;
+
+	while (pos < range->len) {
+		ssize_t ret = pread(range->fd, range->data + pos, range->len - pos, range->offset + pos);
+		if (ret < 0 && errno == EINTR)
+			continue;
+		if (ret <= 0) {
+			range->err = ret < 0 ? errno : EIO;
+			break;
+		}
+		pos += ret;
+	}
+
+	return NULL;
+}
+
+/**
+ * Read a complete file into memory using parallel readers.
+ *
+ * Squashfs reads compressed blocks synchronously, so a single reader of a
+ * streamed bundle has to wait for one network round trip per block.
+ * The ranges are aligned to the filesystem block size, so that no block is
+ * fetched by more than one reader.
+ */
+static GBytes *read_file_parallel(const gchar *filename, GError **error)
+{
+	g_auto(filedesc) fd = -1;
+	g_autofree guint8 *data = NULL;
+	ReadFileRange ranges[READ_FILE_THREADS] = {0};
+	GThread *threads[READ_FILE_THREADS] = {0};
+	struct stat st;
+	struct statfs stfs;
+	gsize size, block_size, per_thread;
+
+	g_return_val_if_fail(filename, NULL);
+	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+
+	fd = g_open(filename, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) != 0 || fstatfs(fd, &stfs) != 0) {
+		int err = errno;
+		g_set_error(error,
+				G_FILE_ERROR,
+				g_file_error_from_errno(err),
+				"Failed to open %s: %s", filename, g_strerror(err));
+		return NULL;
+	}
+
+	size = st.st_size;
+	data = g_malloc(size);
+	block_size = MAX(stfs.f_bsize, 4096);
+	per_thread = (size / READ_FILE_THREADS / block_size + 1) * block_size;
+
+	for (guint i = 0; i < READ_FILE_THREADS; i++) {
+		ranges[i].fd = fd;
+		ranges[i].offset = MIN(i * per_thread, size);
+		ranges[i].data = data + ranges[i].offset;
+		ranges[i].len = MIN(per_thread, size - ranges[i].offset);
+		threads[i] = g_thread_new("read-file", read_file_range, &ranges[i]);
+	}
+
+	for (guint i = 0; i < READ_FILE_THREADS; i++)
+		g_thread_join(threads[i]);
+
+	for (guint i = 0; i < READ_FILE_THREADS; i++) {
+		if (ranges[i].err) {
+			g_set_error(error,
+					G_FILE_ERROR,
+					g_file_error_from_errno(ranges[i].err),
+					"Failed to read %s: %s", filename, g_strerror(ranges[i].err));
+			return NULL;
+		}
+	}
+
+	return g_bytes_new_take(g_steal_pointer(&data), size);
+}
+
 RaucHashIndex *r_hash_index_open(const gchar *label, int data_fd, const gchar *hashes_filename, GError **error)
 {
 	GError *ierror = NULL;
@@ -253,15 +343,15 @@ RaucHashIndex *r_hash_index_open(const gchar *label, int data_fd, const gchar *h
 
 	/* load or calculate chunk hashes */
 	if (hashes_filename && g_file_test(hashes_filename, G_FILE_TEST_IS_REGULAR)) {
-		g_autoptr(GMappedFile) mapped_file = g_mapped_file_new(hashes_filename, FALSE, &ierror);
+		g_autoptr(GBytes) hashes = read_file_parallel(hashes_filename, &ierror);
 		gsize mapped_size;
 
-		if (!mapped_file) {
+		if (!hashes) {
 			g_propagate_error(error, ierror);
 			return NULL;
 		}
 
-		mapped_size = g_mapped_file_get_length(mapped_file);
+		mapped_size = g_bytes_get_size(hashes);
 		g_assert(mapped_size < (gsize)G_MAXUINT32);
 
 		g_info("using existing hash index for %s from %s", label, hashes_filename);
@@ -275,7 +365,7 @@ RaucHashIndex *r_hash_index_open(const gchar *label, int data_fd, const gchar *h
 			idx->count = mapped_size / SHA256_LEN;
 		}
 
-		idx->hashes = g_mapped_file_get_bytes(mapped_file);
+		idx->hashes = g_steal_pointer(&hashes);
 	}
 
 	if (!idx->hashes) {
