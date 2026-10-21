@@ -9,6 +9,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 
 #include "context.h"
 #include "mount.h"
@@ -726,6 +727,99 @@ out:
 	return res;
 }
 
+#define COPY_CHUNKS_THREADS 128
+
+typedef struct {
+	int source_fd;
+	int target_fd;
+	const guint32 *end;
+	guint32 chunks_per_block;
+	GMutex lock;
+	GError *error;
+} CopyChunksContext;
+
+/* Copy the chunks located in the same source block as the first one. */
+static void copy_chunk_group(gpointer data, gpointer user_data)
+{
+	const guint32 *first = data;
+	CopyChunksContext *ctx = user_data;
+	guint32 block = *first / ctx->chunks_per_block;
+	guint8 buf[4096];
+	GError *ierror = NULL;
+
+	/* Without readahead, squashfs only reads a block in one go when the
+	 * first read is at its start. */
+	if (!r_pread_exact(ctx->source_fd, buf, sizeof(buf), (off_t)block * ctx->chunks_per_block * sizeof(buf), &ierror))
+		goto error;
+
+	for (const guint32 *c = first; c < ctx->end && *c / ctx->chunks_per_block == block; c++) {
+		off_t offset = (off_t)*c * sizeof(buf);
+
+		if (!r_pread_exact(ctx->source_fd, buf, sizeof(buf), offset, &ierror) ||
+		    !r_pwrite_lazy(ctx->target_fd, buf, sizeof(buf), offset, &ierror))
+			goto error;
+	}
+	return;
+
+error:
+	if (!ierror)
+		g_set_error(&ierror, R_UPDATE_ERROR, R_UPDATE_ERROR_FAILED, "Source image ended unexpectedly");
+	g_mutex_lock(&ctx->lock);
+	if (!ctx->error)
+		g_propagate_error(&ctx->error, ierror);
+	else
+		g_clear_error(&ierror);
+	g_mutex_unlock(&ctx->lock);
+}
+
+/**
+ * Copy chunks from the source image to the same position in the target.
+ *
+ * Squashfs reads compressed blocks synchronously, so a single reader of a
+ * streamed bundle has to wait for one network round trip per block.
+ * Each source block is handled by one thread, so that no block is fetched
+ * more than once.
+ */
+static gboolean copy_chunks_parallel(int source_fd, int target_fd, GArray *chunks, GError **error)
+{
+	CopyChunksContext ctx = {0};
+	const guint32 *c = (const guint32 *)(void *)chunks->data;
+	GThreadPool *pool;
+	struct statfs stfs;
+
+	if (fstatfs(source_fd, &stfs) != 0) {
+		int err = errno;
+		g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(err), "Failed to stat source image filesystem: %s", g_strerror(err));
+		return FALSE;
+	}
+
+	/* readahead would make the threads wait for blocks read by each other */
+	posix_fadvise(source_fd, 0, 0, POSIX_FADV_RANDOM);
+
+	ctx.source_fd = source_fd;
+	ctx.target_fd = target_fd;
+	ctx.end = c + chunks->len;
+	ctx.chunks_per_block = MAX(stfs.f_bsize, 4096) / 4096;
+	g_mutex_init(&ctx.lock);
+
+	pool = g_thread_pool_new(copy_chunk_group, &ctx, COPY_CHUNKS_THREADS, FALSE, NULL);
+	for (guint i = 0; i < chunks->len; i++) {
+		/* start a new group for each source block */
+		if (i == 0 || c[i] / ctx.chunks_per_block != c[i-1] / ctx.chunks_per_block)
+			g_thread_pool_push(pool, (gpointer)&c[i], NULL);
+	}
+	g_thread_pool_free(pool, FALSE, TRUE);
+
+	g_mutex_clear(&ctx.lock);
+
+	if (ctx.error) {
+		g_propagate_error(error, ctx.error);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 static gboolean copy_block_hash_index_image_to_dev(RaucImage *image, RaucSlot *slot, GError **error)
 {
 	GError *ierror = NULL;
@@ -739,6 +833,7 @@ static gboolean copy_block_hash_index_image_to_dev(RaucImage *image, RaucSlot *s
 	off_t offset = 0;
 	int target_fd = -1;
 	g_autoptr(RaucStats) zero_stats = NULL;
+	g_autoptr(GArray) missing = g_array_new(FALSE, FALSE, sizeof(guint32));
 
 	g_return_val_if_fail(image, FALSE);
 	g_return_val_if_fail(slot, FALSE);
@@ -813,8 +908,9 @@ static gboolean copy_block_hash_index_image_to_dev(RaucImage *image, RaucSlot *s
 	}
 	/* Nothing is valid yet. */
 	tmp->invalid_from = 0;
-	/* This is the data we've just written. */
-	tmp->skip_hash_check = TRUE;
+	/* Chunks only available in the source image are written last, so the
+	 * written range can still contain old data. */
+	tmp->skip_hash_check = FALSE;
 	/* Insert the growing region in the target slot first. */
 	g_ptr_array_insert(sources, 0, g_steal_pointer(&tmp));
 
@@ -856,8 +952,8 @@ static gboolean copy_block_hash_index_image_to_dev(RaucImage *image, RaucSlot *s
 			found = TRUE;
 			r_stats_add(zero_stats, 1);
 		} else {
-			/* Iterate over indices and call get chunk */
-			for (guint s = 0; s < sources->len; s++) {
+			/* Iterate over local indices and call get chunk */
+			for (guint s = 0; s < sources->len - 1; s++) {
 				const RaucHashIndex *source = g_ptr_array_index(sources, s);
 				if (r_hash_index_get_chunk(source, chunk_hashes[c], chunk, &ierror)) {
 					//g_autofree gchar *hash = r_hex_encode(chunk_hashes[c], sizeof(chunk_hashes[c]));
@@ -873,13 +969,11 @@ static gboolean copy_block_hash_index_image_to_dev(RaucImage *image, RaucSlot *s
 		}
 
 		if (!found) {
-			g_autofree gchar *hash = r_hex_encode(chunk_hashes[c], sizeof(chunk_hashes[c]));
-			g_set_error(error,
-					R_HASH_INDEX_ERROR,
-					R_HASH_INDEX_ERROR_NOT_FOUND,
-					"no chunk with required hash [%s] found", hash);
-			res = FALSE;
-			goto out;
+			/* Copied from the source image after the loop */
+			const RaucHashIndex *source = g_ptr_array_index(sources, sources->len-1);
+			r_stats_add(source->match_stats, 1);
+			g_array_append_val(missing, c);
+			continue;
 		}
 
 		/* Write chunk to target
@@ -908,6 +1002,15 @@ static gboolean copy_block_hash_index_image_to_dev(RaucImage *image, RaucSlot *s
 		 * generation, we just set the last 90 percent here. */
 		if (r_context()->progress)
 			r_context_set_step_percentage("copy_image", (R_HASH_INDEX_GEN_PROGRESS_SPAN * 2) + (c + 1) * (100 - (R_HASH_INDEX_GEN_PROGRESS_SPAN * 2)) / chunk_count);
+	}
+
+	{
+		const RaucHashIndex *source = g_ptr_array_index(sources, sources->len-1);
+		if (!copy_chunks_parallel(source->data_fd, target_fd, missing, &ierror)) {
+			g_propagate_error(error, ierror);
+			res = FALSE;
+			goto out;
+		}
 	}
 
 	/* Seek after the written data so this behaves similar to the simpler write helpers */
