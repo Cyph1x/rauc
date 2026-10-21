@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <poll.h>
 #include <pwd.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
@@ -345,6 +346,11 @@ struct RaucNBDTransfer {
 	curl_off_t buffer_size;
 	curl_off_t buffer_pos;
 
+	/* read range, covering the merged requests */
+	guint64 range_from;
+	guint64 range_len;
+	GPtrArray *merged; /* further requests served by this transfer */
+
 	/* configure request */
 	guint64 content_size;
 	guint64 current_time; /* date header from server */
@@ -356,6 +362,7 @@ static void free_transfer(struct RaucNBDTransfer *xfer)
 {
 	g_clear_pointer(&xfer->buffer, g_free);
 	g_clear_pointer(&xfer->etag, g_free);
+	g_clear_pointer(&xfer->merged, g_ptr_array_unref);
 
 	g_free(xfer);
 }
@@ -506,6 +513,9 @@ static void prepare_curl(struct RaucNBDTransfer *xfer)
 	}
 	code |= curl_easy_setopt(xfer->easy, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
 
+	/* share pending connections instead of opening one per request */
+	code |= curl_easy_setopt(xfer->easy, CURLOPT_PIPEWAIT, 1L);
+
 	code |= curl_easy_setopt(xfer->easy, CURLOPT_PRIVATE, xfer);
 
 	if (code)
@@ -560,16 +570,16 @@ static void start_read(struct RaucNBDContext *ctx, struct RaucNBDTransfer *xfer)
 	CURLMcode mcode = 0;
 	g_autofree gchar *range = NULL;
 
-	xfer->buffer = g_malloc(xfer->request.len);
-	xfer->buffer_size = xfer->request.len;
+	xfer->buffer = g_malloc(xfer->range_len);
+	xfer->buffer_size = xfer->range_len;
 	xfer->buffer_pos = 0;
 
 	prepare_curl(xfer);
 	code |= curl_easy_setopt(xfer->easy, CURLOPT_WRITEFUNCTION, write_cb);
 	code |= curl_easy_setopt(xfer->easy, CURLOPT_WRITEDATA, xfer);
 	range = g_strdup_printf("%"G_GUINT64_FORMAT "-%"G_GUINT64_FORMAT,
-			(guint64)xfer->request.from,
-			(guint64)xfer->request.from + xfer->request.len - 1);
+			xfer->range_from,
+			xfer->range_from + xfer->range_len - 1);
 	code |= curl_easy_setopt(xfer->easy, CURLOPT_RANGE, range);
 	if (code)
 		g_error("unexpected error from curl_easy_setopt in %s", G_STRFUNC);
@@ -703,6 +713,69 @@ static void start_request(struct RaucNBDContext *ctx, struct RaucNBDTransfer *xf
 	}
 }
 
+#define MAX_MERGED_READ (4 * 1024 * 1024)
+#define MAX_STREAMS_PER_CONNECTION 8
+
+static gint compare_read_from(gconstpointer a, gconstpointer b)
+{
+	const struct RaucNBDTransfer *xa = *(struct RaucNBDTransfer * const *)a;
+	const struct RaucNBDTransfer *xb = *(struct RaucNBDTransfer * const *)b;
+
+	return (xa->request.from > xb->request.from) - (xa->request.from < xb->request.from);
+}
+
+/* Start the read requests, merging those that touch or overlap, so that each
+ * HTTP range request fetches more data. */
+static void start_reads(struct RaucNBDContext *ctx, GPtrArray *reads)
+{
+	struct RaucNBDTransfer *leader = NULL;
+
+	g_ptr_array_sort(reads, compare_read_from);
+
+	for (guint i = 0; i < reads->len; i++) {
+		struct RaucNBDTransfer *xfer = g_ptr_array_index(reads, i);
+		guint64 end = xfer->request.from + xfer->request.len;
+
+		if (leader && xfer->request.from <= leader->range_from + leader->range_len &&
+		    end - leader->range_from <= MAX_MERGED_READ) {
+			leader->range_len = MAX(leader->range_len, end - leader->range_from);
+			if (!leader->merged)
+				leader->merged = g_ptr_array_new_with_free_func((GDestroyNotify)free_transfer);
+			g_ptr_array_add(leader->merged, xfer);
+			continue;
+		}
+
+		if (leader)
+			start_request(ctx, leader);
+		leader = xfer;
+		leader->range_from = xfer->request.from;
+		leader->range_len = xfer->request.len;
+	}
+
+	if (leader)
+		start_request(ctx, leader);
+}
+
+static gboolean sock_readable(gint sock)
+{
+	struct pollfd pfd = {.fd = sock, .events = POLLIN};
+
+	return poll(&pfd, 1, 0) > 0;
+}
+
+/* Send the reply for one of the requests served by the (merged) transfer. */
+static void send_read_reply(struct RaucNBDContext *ctx, struct RaucNBDTransfer *xfer, struct RaucNBDTransfer *req)
+{
+	req->reply.error = xfer->reply.error;
+
+	if (!r_write_exact(ctx->sock, (guint8*)&req->reply, sizeof(req->reply), NULL))
+		g_error("failed to send nbd read reply header");
+	if (req->reply.error == 0) {
+		if (!r_write_exact(ctx->sock, xfer->buffer + (req->request.from - xfer->range_from), req->request.len, NULL))
+			g_error("failed to send nbd read reply body");
+	}
+}
+
 static gboolean finish_read(struct RaucNBDContext *ctx, struct RaucNBDTransfer *xfer)
 {
 	gboolean res = FALSE;
@@ -726,15 +799,12 @@ static gboolean finish_read(struct RaucNBDContext *ctx, struct RaucNBDTransfer *
 		}
 	}
 
-	if (!r_write_exact(ctx->sock, (guint8*)&xfer->reply, sizeof(xfer->reply), NULL))
-		g_error("failed to send nbd read reply header");
-	if (xfer->reply.error == 0) {
-		if (xfer->buffer_size != xfer->buffer_pos)
-			g_error("incomplete data received from server");
+	if (xfer->reply.error == 0 && xfer->buffer_size != xfer->buffer_pos)
+		g_error("incomplete data received from server");
 
-		if (!r_write_exact(ctx->sock, xfer->buffer, xfer->buffer_size, NULL))
-			g_error("failed to send nbd read reply body");
-	}
+	send_read_reply(ctx, xfer, xfer);
+	for (guint i = 0; xfer->merged && i < xfer->merged->len; i++)
+		send_read_reply(ctx, xfer, g_ptr_array_index(xfer->merged, i));
 
 	collect_curl_stats(ctx, xfer);
 
@@ -917,6 +987,12 @@ gboolean r_nbd_run_server(gint sock, GError **error)
 	ctx.sock = sock;
 	ctx.multi = curl_multi_init();
 
+	/* The throughput of a single connection is limited by its TCP window on
+	 * high latency links, so let curl spread the requests over multiple
+	 * HTTP/2 connections. */
+	if (curl_multi_setopt(ctx.multi, CURLMOPT_MAX_CONCURRENT_STREAMS, (long)MAX_STREAMS_PER_CONNECTION) != CURLM_OK)
+		g_error("unexpected error from curl_multi_setopt in %s", G_STRFUNC);
+
 	waitfd.fd = sock;
 	waitfd.events = CURL_WAIT_POLLIN;
 
@@ -928,34 +1004,48 @@ gboolean r_nbd_run_server(gint sock, GError **error)
 			g_error("unexpected error from curl_multi_wait in %s", G_STRFUNC);
 
 		if ((numfds > 0) && (waitfd.revents & CURL_WAIT_POLLIN)) { /* new event from the client */
-			struct RaucNBDTransfer *xfer = g_malloc0(sizeof(struct RaucNBDTransfer));
-			xfer->ctx = &ctx;
+			g_autoptr(GPtrArray) reads = g_ptr_array_new();
+			gboolean disconnected = FALSE;
 
-			res = r_read_exact(sock, (guint8*)&xfer->request, sizeof(xfer->request), &ierror);
-			if (!res) {
-				if (!ierror) { /* disconnected */
-					ctx.done = TRUE;
-					break;
-				} else {
-					g_propagate_prefixed_error(
-							error,
-							ierror,
-							"failed to read request from client: ");
-					res = FALSE;
-					goto out;
+			/* read all queued requests, so that adjacent reads can be merged */
+			do {
+				struct RaucNBDTransfer *xfer = g_malloc0(sizeof(struct RaucNBDTransfer));
+				xfer->ctx = &ctx;
+
+				res = r_read_exact(sock, (guint8*)&xfer->request, sizeof(xfer->request), &ierror);
+				if (!res) {
+					if (!ierror) { /* disconnected */
+						ctx.done = TRUE;
+						disconnected = TRUE;
+						break;
+					} else {
+						g_propagate_prefixed_error(
+								error,
+								ierror,
+								"failed to read request from client: ");
+						res = FALSE;
+						goto out;
+					}
 				}
-			}
 
-			g_assert(xfer->request.magic == GUINT32_TO_BE(NBD_REQUEST_MAGIC));
-			xfer->request.type = GUINT32_FROM_BE(xfer->request.type);
-			xfer->request.from = GUINT64_FROM_BE(xfer->request.from);
-			xfer->request.len = GUINT32_FROM_BE(xfer->request.len);
-			//g_message("type 0x%x: from 0x%llx+0x%x", xfer->request.type, xfer->request.from, xfer->request.len);
+				g_assert(xfer->request.magic == GUINT32_TO_BE(NBD_REQUEST_MAGIC));
+				xfer->request.type = GUINT32_FROM_BE(xfer->request.type);
+				xfer->request.from = GUINT64_FROM_BE(xfer->request.from);
+				xfer->request.len = GUINT32_FROM_BE(xfer->request.len);
+				//g_message("type 0x%x: from 0x%llx+0x%x", xfer->request.type, xfer->request.from, xfer->request.len);
 
-			xfer->reply.magic = GUINT32_TO_BE(NBD_REPLY_MAGIC);
-			memcpy(xfer->reply.handle, xfer->request.handle, sizeof(xfer->reply.handle));
+				xfer->reply.magic = GUINT32_TO_BE(NBD_REPLY_MAGIC);
+				memcpy(xfer->reply.handle, xfer->request.handle, sizeof(xfer->reply.handle));
 
-			start_request(&ctx, xfer);
+				if (xfer->request.type == NBD_CMD_READ)
+					g_ptr_array_add(reads, xfer);
+				else
+					start_request(&ctx, xfer);
+			} while (!ctx.done && sock_readable(sock));
+
+			start_reads(&ctx, reads);
+			if (disconnected)
+				break;
 		}
 
 		mcode = curl_multi_perform(ctx.multi, &still_running);
