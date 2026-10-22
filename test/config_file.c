@@ -1366,6 +1366,91 @@ send-headers=transaction-id;invalid-key";
 	g_assert_null(config);
 }
 
+static void config_file_streaming_defaults(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	g_autoptr(RaucConfig) config = NULL;
+	g_autoptr(GError) ierror = NULL;
+	gboolean res;
+	g_autofree gchar* pathname = NULL;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n";
+
+	pathname = write_tmp_file(fixture->tmpdir, "streaming.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	res = load_config(pathname, &config, &ierror);
+	g_assert_no_error(ierror);
+	g_assert_true(res);
+	g_assert_cmpuint(config->streaming_parallel_index_reads, ==, 16);
+	g_assert_cmpuint(config->streaming_parallel_chunk_reads, ==, 128);
+	g_assert_cmpuint(config->streaming_max_request_size, ==, 4*1024*1024);
+	g_assert_cmpuint(config->streaming_max_streams_per_connection, ==, 8);
+}
+
+static void config_file_streaming_parallel(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	g_autoptr(RaucConfig) config = NULL;
+	g_autoptr(GError) ierror = NULL;
+	gboolean res;
+	g_autofree gchar* pathname = NULL;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+\n\
+[streaming]\n\
+parallel-index-reads=4\n\
+parallel-chunk-reads=32\n\
+max-request-size=1M\n\
+max-streams-per-connection=0";
+
+	pathname = write_tmp_file(fixture->tmpdir, "streaming.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	res = load_config(pathname, &config, &ierror);
+	g_assert_no_error(ierror);
+	g_assert_true(res);
+	g_assert_cmpuint(config->streaming_parallel_index_reads, ==, 4);
+	g_assert_cmpuint(config->streaming_parallel_chunk_reads, ==, 32);
+	g_assert_cmpuint(config->streaming_max_request_size, ==, 1024*1024);
+	g_assert_cmpuint(config->streaming_max_streams_per_connection, ==, 0);
+}
+
+static void config_file_streaming_parallel_invalid(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	const gchar *invalid[] = {
+		"parallel-chunk-reads=0",
+		"max-request-size=128M",
+	};
+
+	for (gsize i = 0; i < G_N_ELEMENTS(invalid); i++) {
+		g_autoptr(RaucConfig) config = NULL;
+		g_autoptr(GError) ierror = NULL;
+		g_autofree gchar* pathname = NULL;
+		g_autofree gchar *cfg_file = g_strdup_printf("\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+\n\
+[streaming]\n\
+%s", invalid[i]);
+
+		pathname = write_tmp_file(fixture->tmpdir, "streaming.conf", cfg_file, NULL);
+		g_assert_nonnull(pathname);
+
+		g_assert_false(load_config(pathname, &config, &ierror));
+		g_assert_error(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE);
+		g_assert_null(config);
+	}
+}
+
 /* A logger must at least have a 'filename' set.
  * Test that an empty logger causes a failure */
 static void config_file_logger_empty(ConfigFileFixture *fixture,
@@ -1733,6 +1818,15 @@ int main(int argc, char *argv[])
 			config_file_fixture_tear_down);
 	g_test_add("/config-file/send-headers-invalid-value", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_send_headers_invalid_item,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/streaming/defaults", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_streaming_defaults,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/streaming/parallel", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_streaming_parallel,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/streaming/parallel-invalid", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_streaming_parallel_invalid,
 			config_file_fixture_tear_down);
 	g_test_add("/config-file/logger/empty", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_logger_empty,

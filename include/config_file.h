@@ -10,6 +10,14 @@
 #define DEFAULT_MAX_BUNDLE_DOWNLOAD_SIZE 8*1024*1024
 /* Default maximum signature/CMS size (64 KiB) */
 #define DEFAULT_MAX_BUNDLE_SIGNATURE_SIZE 64*1024
+/* Default number of parallel reads when loading a block-hash-index */
+#define DEFAULT_STREAMING_PARALLEL_INDEX_READS 16
+/* Default number of parallel reads when copying chunks from the bundle */
+#define DEFAULT_STREAMING_PARALLEL_CHUNK_READS 128
+/* Default maximum size of merged HTTP range requests (4 MiB) */
+#define DEFAULT_STREAMING_MAX_REQUEST_SIZE 4*1024*1024
+/* Default maximum number of concurrent requests per HTTP/2 connection */
+#define DEFAULT_STREAMING_MAX_STREAMS_PER_CONNECTION 8
 
 typedef enum {
 	R_CONFIG_ERROR_INVALID_FORMAT,
@@ -93,6 +101,10 @@ typedef struct {
 	gchar *streaming_tls_cert;
 	gchar *streaming_tls_key;
 	gchar *streaming_tls_ca;
+	guint streaming_parallel_index_reads;
+	guint streaming_parallel_chunk_reads;
+	guint64 streaming_max_request_size;
+	guint streaming_max_streams_per_connection;
 
 	/* encryption */
 	gchar *encryption_key;

@@ -727,8 +727,6 @@ out:
 	return res;
 }
 
-#define COPY_CHUNKS_THREADS 128
-
 typedef struct {
 	int source_fd;
 	int target_fd;
@@ -802,7 +800,7 @@ static gboolean copy_chunks_parallel(int source_fd, int target_fd, GArray *chunk
 	ctx.chunks_per_block = MAX(stfs.f_bsize, 4096) / 4096;
 	g_mutex_init(&ctx.lock);
 
-	pool = g_thread_pool_new(copy_chunk_group, &ctx, COPY_CHUNKS_THREADS, FALSE, NULL);
+	pool = g_thread_pool_new(copy_chunk_group, &ctx, r_context()->config->streaming_parallel_chunk_reads, FALSE, NULL);
 	for (guint i = 0; i < chunks->len; i++) {
 		/* start a new group for each source block */
 		if (i == 0 || c[i] / ctx.chunks_per_block != c[i-1] / ctx.chunks_per_block)

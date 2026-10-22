@@ -2341,6 +2341,8 @@ gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, CheckBundleP
 			ibundle->nbd_srv->tls_key = g_strdup(r_context()->config->streaming_tls_key);
 		if (!ibundle->nbd_srv->tls_ca)
 			ibundle->nbd_srv->tls_ca = g_strdup(r_context()->config->streaming_tls_ca);
+		ibundle->nbd_srv->max_request_size = r_context()->config->streaming_max_request_size;
+		ibundle->nbd_srv->max_streams_per_connection = r_context()->config->streaming_max_streams_per_connection;
 		res = r_nbd_start_server(ibundle->nbd_srv, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Failed to stream bundle %s: ", ibundle->path);

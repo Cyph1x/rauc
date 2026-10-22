@@ -723,6 +723,30 @@ static gboolean parse_casync_section(GKeyFile *key_file, RaucConfig *c, GError *
 	return TRUE;
 }
 
+/* Consumes an optional integer in the range [min, max], keeping *value if unset. */
+static gboolean consume_bounded_integer(GKeyFile *key_file, const gchar *group, const gchar *key, gint min, gint max, guint *value, GError **error)
+{
+	GError *ierror = NULL;
+	gint tmp = key_file_consume_integer(key_file, group, key, &ierror);
+
+	if (g_error_matches(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_KEY_NOT_FOUND)) {
+		g_clear_error(&ierror);
+		return TRUE;
+	} else if (ierror) {
+		g_propagate_error(error, ierror);
+		return FALSE;
+	}
+
+	if (tmp < min || tmp > max) {
+		g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+				"Value %d for '%s' in [%s] must be between %d and %d", tmp, key, group, min, max);
+		return FALSE;
+	}
+
+	*value = tmp;
+	return TRUE;
+}
+
 static gboolean parse_streaming_section(GKeyFile *key_file, RaucConfig *c, GError **error)
 {
 	GError *ierror = NULL;
@@ -732,8 +756,33 @@ static gboolean parse_streaming_section(GKeyFile *key_file, RaucConfig *c, GErro
 	g_return_val_if_fail(c, FALSE);
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
+	c->streaming_parallel_index_reads = DEFAULT_STREAMING_PARALLEL_INDEX_READS;
+	c->streaming_parallel_chunk_reads = DEFAULT_STREAMING_PARALLEL_CHUNK_READS;
+	c->streaming_max_request_size = DEFAULT_STREAMING_MAX_REQUEST_SIZE;
+	c->streaming_max_streams_per_connection = DEFAULT_STREAMING_MAX_STREAMS_PER_CONNECTION;
+
 	if (!g_key_file_has_group(key_file, "streaming"))
 		return TRUE;
+
+	if (!consume_bounded_integer(key_file, "streaming", "parallel-index-reads", 1, 1024, &c->streaming_parallel_index_reads, error))
+		return FALSE;
+	if (!consume_bounded_integer(key_file, "streaming", "parallel-chunk-reads", 1, 1024, &c->streaming_parallel_chunk_reads, error))
+		return FALSE;
+	if (!consume_bounded_integer(key_file, "streaming", "max-streams-per-connection", 0, 1000, &c->streaming_max_streams_per_connection, error))
+		return FALSE;
+
+	if (g_key_file_has_key(key_file, "streaming", "max-request-size", NULL)) {
+		c->streaming_max_request_size = key_file_consume_binary_suffixed_string(key_file, "streaming", "max-request-size", &ierror);
+		if (ierror) {
+			g_propagate_error(error, ierror);
+			return FALSE;
+		}
+		if (c->streaming_max_request_size > 64*1024*1024) {
+			g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+					"Value for 'max-request-size' in [streaming] must not exceed 64M");
+			return FALSE;
+		}
+	}
 
 	c->streaming_sandbox_user = key_file_consume_string(key_file, "streaming", "sandbox-user", NULL);
 	c->streaming_tls_cert = key_file_consume_string(key_file, "streaming", "tls-cert", NULL);

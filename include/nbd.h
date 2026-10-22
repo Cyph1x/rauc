@@ -40,6 +40,8 @@ typedef struct {
 	gboolean tls_no_verify;
 	GStrv headers; /* array of strings such as 'Foo: bar' */
 	GPtrArray *info_headers; /* array of strings such as 'Foo: bar' */
+	guint64 max_request_size; /* merge adjacent reads up to this size */
+	guint32 max_streams_per_connection; /* 0 for no limit */
 
 	/* discovered information */
 	guint64 data_size; /* bundle size */

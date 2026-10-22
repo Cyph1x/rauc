@@ -321,6 +321,8 @@ struct RaucNBDContext {
 	gboolean tls_no_verify;
 	struct curl_slist *headers_slist;
 	struct curl_slist *initial_headers_slist;
+	guint64 max_request_size; /* merge adjacent reads up to this size */
+	guint32 max_streams_per_connection; /* 0 for no limit */
 
 	/* runtime state */
 	CURLM *multi;
@@ -649,6 +651,8 @@ static void start_configure(struct RaucNBDContext *ctx, struct RaucNBDTransfer *
 		g_variant_dict_lookup(&dict, "no-verify", "b", &ctx->tls_no_verify);
 		g_variant_dict_lookup(&dict, "headers", "^as", &headers);
 		g_variant_dict_lookup(&dict, "info-headers", "^as", &info_headers);
+		g_variant_dict_lookup(&dict, "max-request-size", "t", &ctx->max_request_size);
+		g_variant_dict_lookup(&dict, "max-streams-per-connection", "u", &ctx->max_streams_per_connection);
 		g_assert_nonnull(ctx->url);
 
 		if (headers) {
@@ -658,6 +662,13 @@ static void start_configure(struct RaucNBDContext *ctx, struct RaucNBDTransfer *
 		if (info_headers) {
 			ctx->initial_headers_slist = gstrv_add_to_slist(ctx->initial_headers_slist, info_headers);
 		}
+
+		/* The throughput of a single connection is limited by its TCP window on
+		 * high latency links, so let curl spread the requests over multiple
+		 * HTTP/2 connections. */
+		if (ctx->max_streams_per_connection &&
+		    curl_multi_setopt(ctx->multi, CURLMOPT_MAX_CONCURRENT_STREAMS, (long)ctx->max_streams_per_connection) != CURLM_OK)
+			g_error("unexpected error from curl_multi_setopt in %s", G_STRFUNC);
 	}
 
 	g_message("nbd server configuring for URL: %s", ctx->url);
@@ -713,9 +724,6 @@ static void start_request(struct RaucNBDContext *ctx, struct RaucNBDTransfer *xf
 	}
 }
 
-#define MAX_MERGED_READ (4 * 1024 * 1024)
-#define MAX_STREAMS_PER_CONNECTION 8
-
 static gint compare_read_from(gconstpointer a, gconstpointer b)
 {
 	const struct RaucNBDTransfer *xa = *(struct RaucNBDTransfer * const *)a;
@@ -737,7 +745,7 @@ static void start_reads(struct RaucNBDContext *ctx, GPtrArray *reads)
 		guint64 end = xfer->request.from + xfer->request.len;
 
 		if (leader && xfer->request.from <= leader->range_from + leader->range_len &&
-		    end - leader->range_from <= MAX_MERGED_READ) {
+		    end - leader->range_from <= ctx->max_request_size) {
 			leader->range_len = MAX(leader->range_len, end - leader->range_from);
 			if (!leader->merged)
 				leader->merged = g_ptr_array_new_with_free_func((GDestroyNotify)free_transfer);
@@ -987,12 +995,6 @@ gboolean r_nbd_run_server(gint sock, GError **error)
 	ctx.sock = sock;
 	ctx.multi = curl_multi_init();
 
-	/* The throughput of a single connection is limited by its TCP window on
-	 * high latency links, so let curl spread the requests over multiple
-	 * HTTP/2 connections. */
-	if (curl_multi_setopt(ctx.multi, CURLMOPT_MAX_CONCURRENT_STREAMS, (long)MAX_STREAMS_PER_CONNECTION) != CURLM_OK)
-		g_error("unexpected error from curl_multi_setopt in %s", G_STRFUNC);
-
 	waitfd.fd = sock;
 	waitfd.events = CURL_WAIT_POLLIN;
 
@@ -1178,6 +1180,8 @@ static gboolean nbd_configure(RaucNBDServer *nbd_srv, GError **error)
 	if (nbd_srv->info_headers)
 		g_variant_dict_insert(&dict, "info-headers", "@as",
 				g_variant_new_strv((const gchar **)nbd_srv->info_headers->pdata, nbd_srv->info_headers->len));
+	g_variant_dict_insert(&dict, "max-request-size", "t", nbd_srv->max_request_size);
+	g_variant_dict_insert(&dict, "max-streams-per-connection", "u", nbd_srv->max_streams_per_connection);
 	v = g_variant_dict_end(&dict);
 	{
 		g_autofree gchar *tmp = g_variant_print(v, TRUE);

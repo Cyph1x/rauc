@@ -234,8 +234,6 @@ static void hash_index_prepare(RaucHashIndex *idx)
 	idx->match_stats = r_stats_new(idx->label);
 }
 
-#define READ_FILE_THREADS 16
-
 typedef struct {
 	int fd;
 	guint8 *data;
@@ -275,8 +273,9 @@ static GBytes *read_file_parallel(const gchar *filename, GError **error)
 {
 	g_auto(filedesc) fd = -1;
 	g_autofree guint8 *data = NULL;
-	ReadFileRange ranges[READ_FILE_THREADS] = {0};
-	GThread *threads[READ_FILE_THREADS] = {0};
+	guint n_threads = r_context()->config->streaming_parallel_index_reads;
+	g_autofree ReadFileRange *ranges = g_new0(ReadFileRange, n_threads);
+	g_autofree GThread **threads = g_new0(GThread *, n_threads);
 	struct stat st;
 	struct statfs stfs;
 	gsize size, block_size, per_thread;
@@ -297,9 +296,9 @@ static GBytes *read_file_parallel(const gchar *filename, GError **error)
 	size = st.st_size;
 	data = g_malloc(size);
 	block_size = MAX(stfs.f_bsize, 4096);
-	per_thread = (size / READ_FILE_THREADS / block_size + 1) * block_size;
+	per_thread = (size / n_threads / block_size + 1) * block_size;
 
-	for (guint i = 0; i < READ_FILE_THREADS; i++) {
+	for (guint i = 0; i < n_threads; i++) {
 		ranges[i].fd = fd;
 		ranges[i].offset = MIN(i * per_thread, size);
 		ranges[i].data = data + ranges[i].offset;
@@ -307,10 +306,10 @@ static GBytes *read_file_parallel(const gchar *filename, GError **error)
 		threads[i] = g_thread_new("read-file", read_file_range, &ranges[i]);
 	}
 
-	for (guint i = 0; i < READ_FILE_THREADS; i++)
+	for (guint i = 0; i < n_threads; i++)
 		g_thread_join(threads[i]);
 
-	for (guint i = 0; i < READ_FILE_THREADS; i++) {
+	for (guint i = 0; i < n_threads; i++) {
 		if (ranges[i].err) {
 			g_set_error(error,
 					G_FILE_ERROR,

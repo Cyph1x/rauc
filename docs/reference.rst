@@ -369,6 +369,37 @@ For more information about using the streaming support of RAUC, refer to
   This option can be used to set the path of the CA certificate which should be
   used instead of the system wide store of trusted TLS/HTTPS certificates.
 
+``parallel-index-reads`` (optional)
+  Number of parallel reads used to load the ``block-hash-index`` of an image
+  for :ref:`adaptive updates <sec-adaptive-updates>`.
+  As each read from a streamed bundle needs a network round trip, more
+  parallel reads reduce the impact of high latency.
+  Accepts values from 1 to 1024.
+  Defaults to 16.
+
+``parallel-chunk-reads`` (optional)
+  Number of parallel reads used to copy the chunks of an adaptive update which
+  are not available on the device from the bundle.
+  Accepts values from 1 to 1024.
+  Defaults to 128.
+
+``max-request-size`` (optional)
+  Maximum size of an HTTP range request.
+  Adjacent reads of the bundle are merged into a single request up to this
+  size, to reduce the number of requests sent to the server.
+  Set to 0 to disable merging.
+  Accepts integer values in bytes up to 64M.
+  Supports optional size suffixes: ``K``, ``M``, ``G``, ``T`` (powers of 1024).
+  Defaults to 4M.
+
+``max-streams-per-connection`` (optional)
+  Maximum number of concurrent requests per HTTP/2 connection.
+  When this is reached, a new connection is opened, as the throughput of a
+  single connection is limited on high latency links.
+  Set to 0 to use the default of libcurl.
+  Accepts values from 0 to 1000.
+  Defaults to 8.
+
 .. _send-headers:
 
 ``send-headers`` (optional)
